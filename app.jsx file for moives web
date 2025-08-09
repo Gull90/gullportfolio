@@ -1,0 +1,548 @@
+import React, { useEffect, useState, useRef, useCallback } from "react";
+
+/**
+ * Big-feature Movie Explorer (single-file)
+ * - Uses TMDb API for everything (search, genres, trailers, categories)
+ * - Infinite scroll + load more fallback
+ * - Filters, sorting, search, tabs
+ * - Modal with trailer
+ * - Favorites & Watchlist (localStorage)
+ * - Caching via sessionStorage
+ * - Responsive + hover glassy card
+ *
+ * NOTE: Ensure Tailwind CSS is configured in your project.
+ */
+
+const TMDB_KEY = "809a4b41f16c65f789691ada59049a6b"; // replace if needed
+const TMDB_BASE = "https://api.themoviedb.org/3";
+
+export default function App() {
+  // App state
+  const [theme, setTheme] = useState(() => localStorage.getItem("theme") || "dark");
+
+  const [query, setQuery] = useState("");
+  const [category, setCategory] = useState("trending"); // trending | popular | upcoming
+  const [movies, setMovies] = useState([]);
+  const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const [genres, setGenres] = useState([]);
+  const [selectedGenre, setSelectedGenre] = useState("");
+  const [sortBy, setSortBy] = useState("popularity.desc"); // other options: release_date.desc, vote_average.desc
+
+  const [selectedMovie, setSelectedMovie] = useState(null);
+  const [showTrailer, setShowTrailer] = useState(false);
+
+  const [favorites, setFavorites] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("favorites") || "[]"); } catch { return []; }
+  });
+  const [watchlist, setWatchlist] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("watchlist") || "[]"); } catch { return []; }
+  });
+
+  const observerTarget = useRef(null);
+  const isSearching = query.trim().length > 0;
+
+  // theme effect
+  useEffect(() => {
+    localStorage.setItem("theme", theme);
+    if (theme === "dark") {
+      document.documentElement.classList.add("dark");
+    } else {
+      document.documentElement.classList.remove("dark");
+    }
+  }, [theme]);
+
+  // fetch genres once
+  useEffect(() => {
+    const cacheKey = "tmdb_genres_v1";
+    const cached = sessionStorage.getItem(cacheKey);
+    if (cached) {
+      setGenres(JSON.parse(cached));
+      return;
+    }
+    fetch(`${TMDB_BASE}/genre/movie/list?api_key=${TMDB_KEY}&language=en-US`)
+      .then((r) => r.json())
+      .then((d) => {
+        setGenres(d.genres || []);
+        sessionStorage.setItem(cacheKey, JSON.stringify(d.genres || []));
+      })
+      .catch(() => {/* ignore */});
+  }, []);
+
+  // Build API url depending on category, search, filters, sort and page
+  const buildUrl = (p = 1) => {
+    if (isSearching) {
+      // Search endpoint (query)
+      const params = new URLSearchParams({
+        api_key: TMDB_KEY,
+        query: query,
+        page: p,
+        include_adult: "false",
+        language: "en-US",
+      });
+      return `${TMDB_BASE}/search/movie?${params.toString()}`;
+    }
+
+    // Category endpoints
+    let endpoint = "";
+    if (category === "trending") endpoint = `/trending/movie/week`;
+    else if (category === "popular") endpoint = `/movie/popular`;
+    else if (category === "upcoming") endpoint = `/movie/upcoming`;
+    else endpoint = `/trending/movie/week`;
+
+    // We will use discover endpoint when filters or sorting applied
+    if (selectedGenre || sortBy !== "popularity.desc") {
+      // discover allows filtering & sorting
+      const params = new URLSearchParams({
+        api_key: TMDB_KEY,
+        page: p,
+        language: "en-US",
+        sort_by: sortBy,
+        with_genres: selectedGenre || "",
+      });
+      return `${TMDB_BASE}/discover/movie?${params.toString()}`;
+    }
+
+    const params = new URLSearchParams({
+      api_key: TMDB_KEY,
+      page: p,
+      language: "en-US",
+    });
+    return `${TMDB_BASE}${endpoint}?${params.toString()}`;
+  };
+
+  // Caching helper
+  const fetchWithCache = async (url, cacheKey, ttlSeconds = 60 * 3) => {
+    try {
+      const cached = sessionStorage.getItem(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Date.now() - parsed._t < ttlSeconds * 1000) {
+          return parsed.data;
+        }
+      }
+    } catch {}
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Fetch failed");
+    const data = await res.json();
+    try {
+      sessionStorage.setItem(cacheKey, JSON.stringify({ _t: Date.now(), data }));
+    } catch {}
+    return data;
+  };
+
+  // load movies (initial / when category / search / filters change)
+  const loadMovies = useCallback(async (p = 1, append = false) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const url = buildUrl(p);
+      // create a cache key that depends on url
+      const cacheKey = `tmdb_cache_${btoa(url)}`;
+      const data = await fetchWithCache(url, cacheKey, 60 * 2);
+      const results = data.results || [];
+      setMovies(prev => (append ? [...prev, ...results] : results));
+      setHasMore((data.page || p) < (data.total_pages || 1));
+      setPage(p);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to load movies. Try again.");
+    } finally {
+      setLoading(false);
+    }
+  }, [category, query, selectedGenre, sortBy]);
+
+  // trigger load when category/search/filters/sort changes
+  useEffect(() => {
+    loadMovies(1, false);
+    // reset scroll
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }, [category, query, selectedGenre, sortBy, loadMovies]);
+
+  // infinite scroll: observe sentinel
+  useEffect(() => {
+    if (!observerTarget.current) return;
+    if (!hasMore || loading) return;
+
+    const observer = new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting) {
+        // load next page
+        loadMovies(page + 1, true);
+      }
+    }, { rootMargin: "200px" });
+
+    observer.observe(observerTarget.current);
+    return () => observer.disconnect();
+  }, [observerTarget, hasMore, loading, page, loadMovies]);
+
+  // load more button (fallback)
+  const handleLoadMore = () => loadMovies(page + 1, true);
+
+  // toggle favorite/watchlist
+  const toggleList = (movie, key, setter) => {
+    const id = movie.id;
+    setter(prev => {
+      const exists = prev.find(m => m.id === id);
+      let next;
+      if (exists) next = prev.filter(m => m.id !== id);
+      else next = [...prev, movie];
+      try { localStorage.setItem(key, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
+  const isInList = (movie, list) => list.some(m => m.id === movie.id);
+
+  // open movie details: fetch details & credits & videos
+  const openDetails = async (movie) => {
+    try {
+      setLoading(true);
+      const detailsUrl = `${TMDB_BASE}/movie/${movie.id}?api_key=${TMDB_KEY}&language=en-US`;
+      const creditsUrl = `${TMDB_BASE}/movie/${movie.id}/credits?api_key=${TMDB_KEY}&language=en-US`;
+      const videosUrl = `${TMDB_BASE}/movie/${movie.id}/videos?api_key=${TMDB_KEY}&language=en-US`;
+
+      const [details, credits, videos] = await Promise.all([
+        fetchWithCache(detailsUrl, `movie_detail_${movie.id}`),
+        fetchWithCache(creditsUrl, `movie_credits_${movie.id}`),
+        fetchWithCache(videosUrl, `movie_videos_${movie.id}`),
+      ]);
+
+      setSelectedMovie({
+        ...movie,
+        details,
+        credits,
+        videos,
+      });
+      setShowTrailer(false);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to fetch movie details.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // trailer helper: pick official youtube trailer
+  const findTrailerKey = (videos) => {
+    if (!videos || !videos.results) return null;
+    const youtubeTrailers = videos.results.filter(v => v.site === "YouTube" && v.type === "Trailer");
+    if (youtubeTrailers.length) return youtubeTrailers[0].key;
+    const anyYoutube = videos.results.find(v => v.site === "YouTube");
+    return anyYoutube ? anyYoutube.key : null;
+  };
+
+  // small UI controls arrays
+  const sortOptions = [
+    { value: "popularity.desc", label: "Popularity Desc" },
+    { value: "popularity.asc", label: "Popularity Asc" },
+    { value: "release_date.desc", label: "Newest" },
+    { value: "release_date.asc", label: "Oldest" },
+    { value: "vote_average.desc", label: "Rating Desc" },
+    { value: "vote_average.asc", label: "Rating Asc" },
+  ];
+
+  // small helper formatting
+  const formatYear = (d) => d ? d.slice(0,4) : "-";
+
+  return (
+    <div className={`min-h-screen ${theme === "dark" ? "bg-gray-900 text-white" : "bg-gray-50 text-gray-900"} transition-colors duration-300`}>
+      {/* Header */}
+      <header className="max-w-6xl mx-auto p-4 flex flex-col md:flex-row gap-4 items-center justify-between">
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-extrabold tracking-tight">🎬 Movie Explorer</h1>
+          <p className="text-sm text-gray-400 hidden sm:block">Discover & track films</p>
+        </div>
+
+        <div className="flex items-center gap-3 w-full md:w-auto">
+          {/* Theme toggle */}
+          <button
+            onClick={() => setTheme(t => (t === "dark" ? "light" : "dark"))}
+            className="px-3 py-2 rounded bg-gray-800 dark:bg-gray-200 text-sm"
+          >
+            {theme === "dark" ? "Light" : "Dark"}
+          </button>
+
+          {/* Favorites / Watchlist quick counts */}
+          <div className="text-sm">
+            <span className="mr-3">❤ {favorites.length}</span>
+            <span>🔖 {watchlist.length}</span>
+          </div>
+        </div>
+      </header>
+
+      {/* Controls */}
+      <main className="max-w-6xl mx-auto p-4">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+          {/* Left: search + tabs */}
+          <div className="md:col-span-3 space-y-3">
+            <div className="flex gap-3">
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search movies..."
+                className="flex-1 p-3 rounded bg-white/5 focus:outline-none"
+              />
+              <button onClick={() => { setQuery(""); loadMovies(1, false); }} className="px-3 py-2 rounded bg-indigo-600">Clear</button>
+            </div>
+
+            {/* Tabs */}
+            <div className="flex gap-2 flex-wrap">
+              <TabButton active={category === "trending"} onClick={() => setCategory("trending")}>🔥 Trending</TabButton>
+              <TabButton active={category === "popular"} onClick={() => setCategory("popular")}>⭐ Popular</TabButton>
+              <TabButton active={category === "upcoming"} onClick={() => setCategory("upcoming")}>📅 Upcoming</TabButton>
+              <TabButton active={isSearching} onClick={() => { setCategory("trending"); /* selecting search is implicit */ }}>{isSearching ? "🔎 Searching" : ""}</TabButton>
+            </div>
+
+            {/* Filters row */}
+            <div className="flex gap-3 items-center flex-wrap">
+              <select value={selectedGenre} onChange={(e) => setSelectedGenre(e.target.value)} className="p-2 bg-white/5 rounded">
+                <option value="">All genres</option>
+                {genres.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+              </select>
+
+              <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} className="p-2 bg-white/5 rounded">
+                {sortOptions.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+              </select>
+
+              <button onClick={() => { setSelectedGenre(""); setSortBy("popularity.desc"); }} className="px-3 py-2 bg-gray-700 rounded">Reset</button>
+            </div>
+          </div>
+
+          {/* Right: tools */}
+          <div className="md:col-span-1">
+            <div className="bg-white/3 p-4 rounded-lg">
+              <h3 className="font-semibold mb-2">Quick Actions</h3>
+              <button onClick={() => { setFavorites([]); localStorage.setItem("favorites", JSON.stringify([])); }} className="w-full mb-2 px-3 py-2 bg-red-600/60 rounded">Clear Favorites</button>
+              <button onClick={() => { setWatchlist([]); localStorage.setItem("watchlist", JSON.stringify([])); }} className="w-full px-3 py-2 bg-yellow-600/60 rounded">Clear Watchlist</button>
+            </div>
+          </div>
+        </div>
+
+        {/* Error */}
+        {error && <div className="text-red-400 mb-4">{error}</div>}
+
+        {/* Grid */}
+        <section>
+          {loading && movies.length === 0 ? (
+            <SkeletonGrid />
+          ) : (
+            <>
+              <div className="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                {movies.length === 0 && !loading ? (
+                  <div className="col-span-full text-center text-gray-400 py-10">No movies found.</div>
+                ) : movies.map(movie => (
+                  <MovieCard
+                    key={movie.id}
+                    movie={movie}
+                    onOpen={() => openDetails(movie)}
+                    onToggleFav={() => toggleList(movie, "favorites", setFavorites)}
+                    onToggleWatch={() => toggleList(movie, "watchlist", setWatchlist)}
+                    favorited={isInList(movie, favorites)}
+                    inWatchlist={isInList(movie, watchlist)}
+                    theme={theme}
+                  />
+                ))}
+              </div>
+
+              {/* sentinel for infinite scroll */}
+              <div ref={observerTarget} className="h-2" />
+
+              {/* load more fallback */}
+              <div className="text-center mt-6">
+                {hasMore && !loading && (
+                  <button onClick={handleLoadMore} className="px-4 py-2 bg-green-600 rounded">Load More</button>
+                )}
+                {loading && movies.length > 0 && <p className="mt-2">Loading more...</p>}
+              </div>
+            </>
+          )}
+        </section>
+
+        {/* bottom spacing */}
+        <div className="h-24" />
+      </main>
+
+      {/* Modal for details */}
+      {selectedMovie && (
+        <DetailsModal
+          movie={selectedMovie}
+          onClose={() => setSelectedMovie(null)}
+          onPlayTrailer={() => setShowTrailer(true)}
+          trailerKey={findTrailerKey(selectedMovie.videos)}
+          onToggleFav={() => toggleList(selectedMovie, "favorites", setFavorites)}
+          onToggleWatch={() => toggleList(selectedMovie, "watchlist", setWatchlist)}
+          favorited={isInList(selectedMovie, favorites)}
+          inWatchlist={isInList(selectedMovie, watchlist)}
+        />
+      )}
+
+      {/* trailer fullscreen overlay */}
+      {selectedMovie && showTrailer && findTrailerKey(selectedMovie.videos) && (
+        <div className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-60 p-4">
+          <div className="w-full max-w-4xl aspect-video bg-black">
+            <iframe
+              title="trailer"
+              src={`https://www.youtube.com/embed/${findTrailerKey(selectedMovie.videos)}?autoplay=1`}
+              frameBorder="0"
+              allow="autoplay; encrypted-media"
+              allowFullScreen
+              className="w-full h-full"
+            />
+          </div>
+          <button onClick={() => setShowTrailer(false)} className="absolute top-6 right-6 text-white bg-red-600 px-3 py-2 rounded">Close</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- Small subcomponents ---------- */
+
+function TabButton({ children, active, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`px-3 py-2 rounded ${active ? "bg-indigo-600" : "bg-white/5"}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function SkeletonGrid() {
+  const arr = Array.from({ length: 8 });
+  return (
+    <div className="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+      {arr.map((_, i) => (
+        <div key={i} className="animate-pulse bg-white/5 rounded-lg p-2 h-72" />
+      ))}
+    </div>
+  );
+}
+
+function MovieCard({ movie, onOpen, onToggleFav, onToggleWatch, favorited, inWatchlist, theme }) {
+  // movie may come from search (fields differ), so normalize
+  const title = movie.title || movie.name || movie.original_title;
+  const posterPath = movie.poster_path ? `https://image.tmdb.org/t/p/w500${movie.poster_path}` : (movie.poster ? movie.poster : null);
+  const year = movie.release_date ? movie.release_date.slice(0,4) : (movie.first_air_date ? movie.first_air_date.slice(0,4) : "—");
+  const rating = movie.vote_average || movie.vote_average === 0 ? movie.vote_average.toFixed(1) : "-";
+
+  return (
+    <div
+      className="relative group rounded-xl overflow-hidden shadow-lg transform transition duration-300 hover:scale-105 cursor-pointer"
+      onClick={onOpen}
+    >
+      <div
+        className="w-full h-72 bg-gray-800 flex items-end rounded-xl"
+        style={{
+          backgroundImage: posterPath ? `url(${posterPath})` : undefined,
+          backgroundSize: "cover",
+          backgroundPosition: "center",
+        }}
+      >
+        {/* overlay gradient bottom */}
+        <div className="absolute inset-0 bg-gradient-to-t from-black/70 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+
+        {/* glassy bottom info */}
+        <div className="absolute left-3 right-3 bottom-3 p-3 rounded-lg bg-white/5 backdrop-blur-sm opacity-0 group-hover:opacity-100 transition-all duration-300">
+          <div className="flex justify-between items-start">
+            <div>
+              <h3 className={`${theme === "dark" ? "text-white" : "text-black"} font-semibold`}>{title}</h3>
+              <p className="text-sm text-gray-300">⭐ {rating} • {year}</p>
+            </div>
+
+            <div className="flex flex-col gap-2 ml-2">
+              <button onClick={(e) => { e.stopPropagation(); onToggleFav(); }} className={`px-2 py-1 rounded ${favorited ? "bg-red-500" : "bg-white/10"}`}>
+                {favorited ? "❤" : "♡"}
+              </button>
+              <button onClick={(e) => { e.stopPropagation(); onToggleWatch(); }} className={`px-2 py-1 rounded ${inWatchlist ? "bg-yellow-500" : "bg-white/10"}`}>
+                {inWatchlist ? "✔" : "🔖"}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* small top-right badge */}
+        <div className="absolute top-3 right-3 p-1 rounded bg-black/50 text-xs">{rating}</div>
+
+        {/* poster img for accessibility - invisible but ensures lazy load */}
+        {posterPath ? (
+          <img src={posterPath} alt={title} loading="lazy" className="sr-only" />
+        ) : (
+          <div className="sr-only">{title}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DetailsModal({ movie, onClose, onPlayTrailer, trailerKey, onToggleFav, onToggleWatch, favorited, inWatchlist }) {
+  const details = movie.details || {};
+  const credits = movie.credits || {};
+  const overview = details.overview || movie.overview || "No description available.";
+  const runtime = details.runtime ? `${details.runtime} min` : "-";
+  const director = (credits.crew || []).find(c => c.job === "Director")?.name || "-";
+  const year = details.release_date ? details.release_date.slice(0,4) : (movie.release_date ? movie.release_date.slice(0,4) : "-");
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+      <div className="bg-white dark:bg-gray-900 rounded-lg max-w-4xl w-full overflow-auto max-h-[90vh]">
+        <div className="flex justify-between items-center p-4 border-b">
+          <h2 className="text-lg font-bold">{movie.title || movie.name}</h2>
+          <div className="flex gap-2">
+            <button onClick={onPlayTrailer} className="px-3 py-1 bg-red-600 text-white rounded" disabled={!trailerKey}>Play Trailer</button>
+            <button onClick={() => { onToggleFav(); }} className={`px-3 py-1 rounded ${favorited ? "bg-red-500" : "bg-gray-200"}`}>{favorited ? "Unfav" : "Fav"}</button>
+            <button onClick={() => { onToggleWatch(); }} className={`px-3 py-1 rounded ${inWatchlist ? "bg-yellow-400" : "bg-gray-200"}`}>{inWatchlist ? "Remove" : "Watchlist"}</button>
+            <button onClick={onClose} className="px-3 py-1 bg-gray-200 rounded">Close</button>
+          </div>
+        </div>
+
+        <div className="p-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="md:col-span-1">
+            {details.poster_path || movie.poster_path ? (
+              <img src={`https://image.tmdb.org/t/p/w500${details.poster_path || movie.poster_path}`} alt={movie.title} className="w-full rounded" />
+            ) : (
+              <div className="w-full h-64 bg-gray-200 rounded" />
+            )}
+          </div>
+          <div className="md:col-span-2 space-y-3">
+            <div className="flex justify-between items-start">
+              <div>
+                <p className="text-sm text-gray-500">{year} • {runtime}</p>
+                <p className="text-sm text-gray-500">Director: {director}</p>
+              </div>
+              <div className="text-right">
+                <p className="font-semibold">⭐ {(details.vote_average || movie.vote_average || 0).toFixed(1)}</p>
+                <p className="text-sm text-gray-500">{details.vote_count || movie.vote_count || 0} votes</p>
+              </div>
+            </div>
+
+            <p className="text-gray-700 dark:text-gray-300">{overview}</p>
+
+            <div>
+              <h4 className="font-semibold">Cast</h4>
+              <div className="flex gap-2 overflow-x-auto py-2">
+                {(credits.cast || []).slice(0,8).map(c => (
+                  <div key={c.cast_id || c.credit_id} className="min-w-[90px] text-center">
+                    <img src={c.profile_path ? `https://image.tmdb.org/t/p/w200${c.profile_path}` : undefined} alt={c.name} className="w-20 h-28 object-cover rounded mb-1" />
+                    <div className="text-xs">{c.name}</div>
+                    <div className="text-xs text-gray-400">{c.character}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* genres */}
+            <div className="flex gap-2 flex-wrap">
+              {(details.genres || movie.genre_ids || []).map(g => (
+                <span key={g.id || g} className="px-2 py-1 bg-gray-200 rounded text-sm">{g.name || g}</span>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
